@@ -34,3 +34,8 @@
 *cmake-build-*
 *.idea
 **build**
+
+.vscode/
+*.png
+*.bmp
+*.jpg
