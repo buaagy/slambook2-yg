@@ -51,8 +51,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   //-- 读取图像
-  Mat img_1 = imread(argv[1], CV_LOAD_IMAGE_COLOR);
-  Mat img_2 = imread(argv[2], CV_LOAD_IMAGE_COLOR);
+  Mat img_1 = imread(argv[1], IMREAD_COLOR);
+  Mat img_2 = imread(argv[2], IMREAD_COLOR);
   assert(img_1.data && img_2.data && "Can not load images!");
 
   vector<KeyPoint> keypoints_1, keypoints_2;
@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
   cout << "一共找到了" << matches.size() << "组匹配点" << endl;
 
   // 建立3D点
-  Mat d1 = imread(argv[3], CV_LOAD_IMAGE_UNCHANGED);       // 深度图为16位无符号数，单通道图像
+  Mat d1 = imread(argv[3], IMREAD_UNCHANGED);       // 深度图为16位无符号数，单通道图像
   Mat K = (Mat_<double>(3, 3) << 520.9, 0, 325.1, 0, 521.0, 249.7, 0, 0, 1);
   vector<Point3f> pts_3d;
   vector<Point2f> pts_2d;
@@ -161,6 +161,7 @@ void find_feature_matches(const Mat &img_1, const Mat &img_2,
   }
 }
 
+// 像素坐标转相机归一化坐标
 Point2d pixel2cam(const Point2d &p, const Mat &K) {
   return Point2d
     (
@@ -169,6 +170,7 @@ Point2d pixel2cam(const Point2d &p, const Mat &K) {
     );
 }
 
+// 手写高斯牛顿法
 void bundleAdjustmentGaussNewton(
   const VecVector3d &points_3d,
   const VecVector2d &points_2d,
@@ -189,14 +191,16 @@ void bundleAdjustmentGaussNewton(
     cost = 0;
     // compute cost
     for (int i = 0; i < points_3d.size(); i++) {
-      Eigen::Vector3d pc = pose * points_3d[i];
+      Eigen::Vector3d pc = pose * points_3d[i]; // 世界坐标系->相机坐标系
       double inv_z = 1.0 / pc[2];
       double inv_z2 = inv_z * inv_z;
-      Eigen::Vector2d proj(fx * pc[0] / pc[2] + cx, fy * pc[1] / pc[2] + cy);
+      Eigen::Vector2d proj(fx * pc[0] / pc[2] + cx, fy * pc[1] / pc[2] + cy); // 相机坐标系->像素坐标系
 
+      // 计算单点的重投影误差
       Eigen::Vector2d e = points_2d[i] - proj;
-
       cost += e.squaredNorm();
+
+      // 构建雅可比矩阵(2行*6列)
       Eigen::Matrix<double, 2, 6> J;
       J << -fx * inv_z,
         0,
@@ -210,11 +214,13 @@ void bundleAdjustmentGaussNewton(
         fy + fy * pc[1] * pc[1] * inv_z2,
         -fy * pc[0] * pc[1] * inv_z2,
         -fy * pc[0] * inv_z;
-
+        
+      // 更新H和b
       H += J.transpose() * J;
       b += -J.transpose() * e;
     }
-
+    
+    // 求解增量方程/正规方程,得到位姿增量
     Vector6d dx;
     dx = H.ldlt().solve(b);
 
@@ -222,18 +228,20 @@ void bundleAdjustmentGaussNewton(
       cout << "result is nan!" << endl;
       break;
     }
-
+    
     if (iter > 0 && cost >= lastCost) {
       // cost increase, update is not good
       cout << "cost: " << cost << ", last cost: " << lastCost << endl;
       break;
     }
 
-    // update your estimation
+    // 更新位姿估计
     pose = Sophus::SE3d::exp(dx) * pose;
     lastCost = cost;
 
     cout << "iteration " << iter << " cost=" << std::setprecision(12) << cost << endl;
+
+    // 当位姿增量足够小时,则跳出迭代
     if (dx.norm() < 1e-6) {
       // converge
       break;
