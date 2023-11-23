@@ -61,7 +61,7 @@ private:
     const cv::Mat &img2;
     const VecVector2d &px_ref;
     const vector<double> depth_ref;
-    Sophus::SE3d &T21;
+    Sophus::SE3d &T21; // 第一帧到第N帧的SE3
     VecVector2d projection; // projected points
 
     std::mutex hessian_mutex;
@@ -120,63 +120,70 @@ inline float GetPixelValue(const cv::Mat &img, float x, float y) {
     );
 }
 
+// 调用命令:build/direct_method
 int main(int argc, char **argv) {
-
+    // 读取第一帧图像和视差图
     cv::Mat left_img = cv::imread(left_file, 0);
     cv::Mat disparity_img = cv::imread(disparity_file, 0);
-
-    // let's randomly pick pixels in the first image and generate some 3d points in the first image's frame
+    
+    // 在第一帧图像中随机选取2000个像素,保存像素坐标和对应的深度到vector中
     cv::RNG rng;
     int nPoints = 2000;
     int boarder = 20;
     VecVector2d pixels_ref;
     vector<double> depth_ref;
-
-    // generate pixels in ref and load depth data
     for (int i = 0; i < nPoints; i++) {
+        // 随机选取像素
         int x = rng.uniform(boarder, left_img.cols - boarder);  // don't pick pixels close to boarder
         int y = rng.uniform(boarder, left_img.rows - boarder);  // don't pick pixels close to boarder
+        // 从视差计算深度
         int disparity = disparity_img.at<uchar>(y, x);
         double depth = fx * baseline / disparity; // you know this is disparity to depth
         depth_ref.push_back(depth);
         pixels_ref.push_back(Eigen::Vector2d(x, y));
     }
 
-    // estimates 01~05.png's pose using this information
+    // 估计后续帧的位姿,即参考帧(第一帧)到后续帧的SE3
     Sophus::SE3d T_cur_ref;
-
-    for (int i = 1; i < 6; i++) {  // 1~10
-        cv::Mat img = cv::imread((fmt_others % i).str(), 0);
+    for (int i = 1; i < 6; i++) {  // 1~5
+        cv::Mat cur_img = cv::imread((fmt_others % i).str(), 0);
         // try single layer by uncomment this line
-        // DirectPoseEstimationSingleLayer(left_img, img, pixels_ref, depth_ref, T_cur_ref);
-        DirectPoseEstimationMultiLayer(left_img, img, pixels_ref, depth_ref, T_cur_ref);
+        DirectPoseEstimationSingleLayer(left_img, cur_img, pixels_ref, depth_ref, T_cur_ref);
+        // DirectPoseEstimationMultiLayer(left_img, cur_img, pixels_ref, depth_ref, T_cur_ref);
     }
     return 0;
 }
 
+// 单层直接法
 void DirectPoseEstimationSingleLayer(
     const cv::Mat &img1,
     const cv::Mat &img2,
     const VecVector2d &px_ref,
     const vector<double> depth_ref,
     Sophus::SE3d &T21) {
-
+    // 参数
     const int iterations = 10;
-    double cost = 0, lastCost = 0;
+    double cost = 0;
+    double lastCost = 0;
     auto t1 = chrono::steady_clock::now();
     JacobianAccumulator jaco_accu(img1, img2, px_ref, depth_ref, T21);
-
+    
+    // 迭代
     for (int iter = 0; iter < iterations; iter++) {
+        // 重置H,b,cost为0
         jaco_accu.reset();
+
+        // 累计计算雅可比,得到本次迭代的H,b,cost
         cv::parallel_for_(cv::Range(0, px_ref.size()),
                           std::bind(&JacobianAccumulator::accumulate_jacobian, &jaco_accu, std::placeholders::_1));
         Matrix6d H = jaco_accu.hessian();
         Vector6d b = jaco_accu.bias();
-
-        // solve update and put it into estimation
-        Vector6d update = H.ldlt().solve(b);;
-        T21 = Sophus::SE3d::exp(update) * T21;
         cost = jaco_accu.cost_func();
+
+        // 求解增量方程,并更新位姿估计
+        // 求解线性方程组Hx=b时，若H为对称正定矩阵,则可以使用H.ldlt().solve(b)求解，包含两步:LDLT分解和求解线性方程组
+        Vector6d update = H.ldlt().solve(b);
+        T21 = Sophus::SE3d::exp(update) * T21;
 
         if (std::isnan(update[0])) {
             // sometimes occurred when we have a black or white patch and H is irreversible
@@ -187,11 +194,13 @@ void DirectPoseEstimationSingleLayer(
             cout << "cost increased: " << cost << ", " << lastCost << endl;
             break;
         }
+        // 增量足够小时,则停止迭代
         if (update.norm() < 1e-3) {
             // converge
             break;
         }
 
+        // 保存本次迭代的cost
         lastCost = cost;
         cout << "iteration: " << iter << ", cost: " << cost << endl;
     }
@@ -199,7 +208,7 @@ void DirectPoseEstimationSingleLayer(
     cout << "T21 = \n" << T21.matrix() << endl;
     auto t2 = chrono::steady_clock::now();
     auto time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);
-    cout << "direct method for single layer: " << time_used.count() << endl;
+    cout << "direct method for single layer: " << time_used.count() << "s" << endl;
 
     // plot the projected pixels here
     cv::Mat img2_show;
@@ -218,8 +227,8 @@ void DirectPoseEstimationSingleLayer(
     cv::waitKey();
 }
 
+// 累计计算雅可比
 void JacobianAccumulator::accumulate_jacobian(const cv::Range &range) {
-
     // parameters
     const int half_patch_size = 1;
     int cnt_good = 0;
@@ -229,54 +238,66 @@ void JacobianAccumulator::accumulate_jacobian(const cv::Range &range) {
 
     for (size_t i = range.start; i < range.end; i++) {
 
-        // compute the projection in the second image
+        // 计算第一帧的3D点
         Eigen::Vector3d point_ref =
             depth_ref[i] * Eigen::Vector3d((px_ref[i][0] - cx) / fx, (px_ref[i][1] - cy) / fy, 1);
+        // 计算当前帧的3D点
         Eigen::Vector3d point_cur = T21 * point_ref;
-        if (point_cur[2] < 0)   // depth invalid
+        // 判断深度是否有效
+        if (point_cur[2] < 0) {
             continue;
-
-        float u = fx * point_cur[0] / point_cur[2] + cx, v = fy * point_cur[1] / point_cur[2] + cy;
+        }
+        
+        // 投影到当前帧的像素坐标系,并判断像素坐标是否有效
+        float u = fx * point_cur[0] / point_cur[2] + cx;
+        float v = fy * point_cur[1] / point_cur[2] + cy;
         if (u < half_patch_size || u > img2.cols - half_patch_size || v < half_patch_size ||
-            v > img2.rows - half_patch_size)
+            v > img2.rows - half_patch_size) {
             continue;
+        }
 
         projection[i] = Eigen::Vector2d(u, v);
-        double X = point_cur[0], Y = point_cur[1], Z = point_cur[2],
-            Z2 = Z * Z, Z_inv = 1.0 / Z, Z2_inv = Z_inv * Z_inv;
+        double X = point_cur[0];
+        double Y = point_cur[1];
+        double Z = point_cur[2];
+        double Z2 = Z * Z;
+        double Z_inv = 1.0 / Z;
+        double Z2_inv = Z_inv * Z_inv;
         cnt_good++;
 
-        // and compute error and jacobian
+        // 计算残差和雅可比矩阵
         for (int x = -half_patch_size; x <= half_patch_size; x++)
             for (int y = -half_patch_size; y <= half_patch_size; y++) {
-
+                // 计算残差
                 double error = GetPixelValue(img1, px_ref[i][0] + x, px_ref[i][1] + y) -
                                GetPixelValue(img2, u + x, v + y);
+                
+                // 构建雅可比矩阵,参考14讲公式8.19
+                // 重投影误差对相机位姿李代数的雅可比矩阵(维度2*6),其中,重投影误差=预测值-观测值
                 Matrix26d J_pixel_xi;
-                Eigen::Vector2d J_img_pixel;
-
                 J_pixel_xi(0, 0) = fx * Z_inv;
                 J_pixel_xi(0, 1) = 0;
                 J_pixel_xi(0, 2) = -fx * X * Z2_inv;
                 J_pixel_xi(0, 3) = -fx * X * Y * Z2_inv;
                 J_pixel_xi(0, 4) = fx + fx * X * X * Z2_inv;
                 J_pixel_xi(0, 5) = -fx * Y * Z_inv;
-
                 J_pixel_xi(1, 0) = 0;
                 J_pixel_xi(1, 1) = fy * Z_inv;
                 J_pixel_xi(1, 2) = -fy * Y * Z2_inv;
                 J_pixel_xi(1, 3) = -fy - fy * Y * Y * Z2_inv;
                 J_pixel_xi(1, 4) = fy * X * Y * Z2_inv;
                 J_pixel_xi(1, 5) = fy * X * Z_inv;
-
-                J_img_pixel = Eigen::Vector2d(
+                
+                // X和Y方向的像素梯度(维度2*1)
+                Eigen::Vector2d J_img_pixel = Eigen::Vector2d(
                     0.5 * (GetPixelValue(img2, u + 1 + x, v + y) - GetPixelValue(img2, u - 1 + x, v + y)),
                     0.5 * (GetPixelValue(img2, u + x, v + 1 + y) - GetPixelValue(img2, u + x, v - 1 + y))
                 );
 
-                // total jacobian
+                // 整体雅可比矩阵(维度6*1)
                 Vector6d J = -1.0 * (J_img_pixel.transpose() * J_pixel_xi).transpose();
-
+                
+                // 更新H,b,cost
                 hessian += J * J.transpose();
                 bias += -error * J;
                 cost_tmp += error * error;
@@ -292,6 +313,7 @@ void JacobianAccumulator::accumulate_jacobian(const cv::Range &range) {
     }
 }
 
+// 多层直接法
 void DirectPoseEstimationMultiLayer(
     const cv::Mat &img1,
     const cv::Mat &img2,
